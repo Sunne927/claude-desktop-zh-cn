@@ -42,6 +42,7 @@ $script:SkipFrontendFileBackups = $false
 $script:ClaudeProcessScopePaths = $null
 $script:ClaudeConfigPathsOverride = $null
 $script:AllowWindowsAppsWrite = $false
+$script:UninstallWarnings = 0
 
 $script:ExplicitClaudePath = ""
 if ($ClaudePath) { $script:ExplicitClaudePath = $ClaudePath }
@@ -5160,7 +5161,7 @@ function Uninstall-WindowsLanguagePack {
 
     if ($resourcesPath -match '(?i)\\WindowsApps\\') {
         Write-Step "还原 WindowsApps 包的所有者和权限"
-        Restore-ClaudePackageAcl
+        Invoke-UninstallStep { Restore-ClaudePackageAcl }
     }
     if (@(Get-AppxForkDirectories).Count -gt 0) {
         Write-Step "清理 Microsoft Store 中文副本"
@@ -5203,22 +5204,40 @@ function Uninstall-AppxForks {
     }
 
     Write-Step "[5/$total] 删除中文副本数据"
-    Remove-AppxForkProfile
+    Invoke-UninstallStep { Remove-AppxForkProfile }
 
     Write-Step "[6/$total] 恢复原 Store 版语言配置"
-    Restore-StoreClaudeLocale
+    Invoke-UninstallStep { Restore-StoreClaudeLocale }
 
     Write-Step "[7/$total] 还原 Store 原包的所有者和权限"
-    Restore-ClaudePackageAcl
+    Invoke-UninstallStep { Restore-ClaudePackageAcl }
 
     Write-Step "[8/$total] 清理安装器临时文件"
-    Remove-InstallerLeftovers
+    Invoke-UninstallStep { Remove-InstallerLeftovers }
 
     Write-Host ""
-    Write-Host "卸载完成。原 Microsoft Store 版 Claude 可继续从开始菜单使用。" -ForegroundColor Green
+    if ($script:UninstallWarnings -gt 0) {
+        Write-Host "卸载已完成主要步骤，但有 $($script:UninstallWarnings) 项没有清理干净（见上方 [警告]）。可以重新运行卸载重试。" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "卸载完成。原 Microsoft Store 版 Claude 可继续从开始菜单使用。" -ForegroundColor Green
+    }
     $logDir = Get-InstallLogDirectory
     if ($logDir) {
         Write-Host "仅保留安装日志（排查问题用，可手动删除）: $logDir" -ForegroundColor DarkGray
+    }
+}
+
+function Invoke-UninstallStep {
+    param([scriptblock]$Step)
+
+    # 副本已删除后的收尾步骤互不依赖，某一步失败不能让后面的清理全部跳过。
+    try {
+        & $Step
+    }
+    catch {
+        $script:UninstallWarnings++
+        Write-Host "  [警告] 这一步没有完成：$($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 
@@ -5345,36 +5364,112 @@ function Restore-ClaudePackageAcl {
         if (-not (Test-Path -LiteralPath $app)) {
             continue
         }
-        $probes = @(
-            $app,
-            (Join-Path $app "resources"),
-            (Join-Path $app "Claude.exe"),
-            (Join-Path $app "resources\app.asar"),
-            (Join-Path $app "resources\ion-dist.asar"),
-            (Join-Path $app "resources\cowork-svc.exe")
-        ) | Where-Object { Test-Path -LiteralPath $_ }
-        if (@($probes | Where-Object { Test-PackageItemAclModified $_ }).Count -eq 0) {
+        $items = @(@(Get-Item -LiteralPath $app -Force) + @(Get-ChildItem -LiteralPath $app -Recurse -Force -ErrorAction SilentlyContinue))
+        if (@($items | Where-Object { Test-PackageItemAclModified $_.FullName }).Count -eq 0) {
             continue
         }
 
         $found = $true
         Write-Host "  检测到旧版本改过权限，正在还原: $app" -ForegroundColor Yellow
-        $resetOutput = & icacls.exe $app /reset /T /C /Q 2>&1
-        $ownerOutput = & icacls.exe $app /setowner "*S-1-5-18" /T /C /Q 2>&1
-        $remaining = @($probes | Where-Object { Test-PackageItemAclModified $_ })
+        # 管理员对 SYSTEM 拥有的文件没有改权限的权利，icacls /setowner 也不会启用还原特权，
+        # 直接操作会拒绝访问。启用 SeRestorePrivilege 后先把所有者设为 Administrators，
+        # 重置为纯继承权限，再把所有者改回 SYSTEM，结果与从未被改动的 MSIX 包一致。
+        Enable-ProcessPrivilege "SeRestorePrivilege"
+        Enable-ProcessPrivilege "SeTakeOwnershipPrivilege"
+        $administrators = [Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
+        $system = [Security.Principal.SecurityIdentifier]::new("S-1-5-18")
+        $errors = @()
+        foreach ($item in $items) {
+            try { Set-ItemOwner $item.FullName $administrators } catch { $errors += "$($item.FullName): $($_.Exception.Message)" }
+        }
+        $errors += @(Invoke-NativeCommand "icacls.exe" @($app, "/reset", "/T", "/C", "/Q") |
+            Where-Object { $_ -match ':' })
+        foreach ($item in $items) {
+            try { Set-ItemOwner $item.FullName $system } catch { $errors += "$($item.FullName): $($_.Exception.Message)" }
+        }
+        $remaining = @($items | Where-Object { Test-PackageItemAclModified $_.FullName })
         if ($remaining.Count -eq 0) {
             Write-Host "  已还原为 MSIX 默认权限（所有者 SYSTEM，无额外授权）" -ForegroundColor Green
         }
         else {
-            Write-Host "  [警告] 以下位置的权限未能完全还原：" -ForegroundColor Yellow
-            foreach ($path in $remaining) {
-                Write-Host "         $path" -ForegroundColor DarkYellow
+            $script:UninstallWarnings++
+            Write-Host "  [警告] 以下 $($remaining.Count) 处权限未能完全还原：" -ForegroundColor Yellow
+            foreach ($item in @($remaining | Select-Object -First 10)) {
+                Write-Host "         $($item.FullName)" -ForegroundColor DarkYellow
             }
-            Write-Host "         icacls: $(($resetOutput + $ownerOutput) -join ' ')" -ForegroundColor DarkGray
+            Write-Host "         $(@($errors | Select-Object -First 5) -join ' ')" -ForegroundColor DarkGray
         }
     }
     if (-not $found) {
         Write-Host "  Store 原包权限正常，无需还原。" -ForegroundColor DarkGray
+    }
+}
+
+function Enable-ProcessPrivilege {
+    param([string]$Name)
+
+    if (-not ("ClaudeZhCnTokenPrivilege" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class ClaudeZhCnTokenPrivilege {
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool LookupPrivilegeValue(string system, string name, out long luid);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivileges state, int length, IntPtr previous, IntPtr returnLength);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [StructLayout(LayoutKind.Sequential, Pack = 1)] struct TokenPrivileges { public int Count; public long Luid; public int Attributes; }
+    public static bool Enable(string name) {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x28, out token)) return false;
+        try {
+            var state = new TokenPrivileges { Count = 1, Attributes = 2 };
+            if (!LookupPrivilegeValue(null, name, out state.Luid)) return false;
+            if (!AdjustTokenPrivileges(token, false, ref state, 0, IntPtr.Zero, IntPtr.Zero)) return false;
+            return Marshal.GetLastWin32Error() == 0;
+        } finally { CloseHandle(token); }
+    }
+}
+"@
+    }
+    if (-not [ClaudeZhCnTokenPrivilege]::Enable($Name)) {
+        throw "无法启用 $Name，请确认以管理员身份运行。"
+    }
+}
+
+function Set-ItemOwner {
+    param(
+        [string]$Path,
+        [Security.Principal.SecurityIdentifier]$Owner
+    )
+
+    # 只写所有者这一段，不碰 DACL。
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $security = New-Object System.Security.AccessControl.DirectorySecurity
+        $security.SetOwner($Owner)
+        [IO.Directory]::SetAccessControl($Path, $security)
+    }
+    else {
+        $security = New-Object System.Security.AccessControl.FileSecurity
+        $security.SetOwner($Owner)
+        [IO.File]::SetAccessControl($Path, $security)
+    }
+}
+
+function Invoke-NativeCommand {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+
+    # Windows PowerShell 5.1 在 ErrorActionPreference=Stop 时会把原生命令的 stderr 当成终止错误。
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        return @(& $FilePath @Arguments 2>&1 | ForEach-Object { [string]$_ })
+    }
+    finally {
+        $ErrorActionPreference = $previous
     }
 }
 
