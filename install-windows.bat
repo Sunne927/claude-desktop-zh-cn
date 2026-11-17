@@ -41,8 +41,8 @@ if errorlevel 1 (
 
 echo Requesting administrator privileges...
 echo A UAC prompt should appear. If you cancel it, this window stays open with an error message.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { function q($v) { $quote=[string][char]34; return $quote + ([string]$v).Replace($quote, ('\' + $quote)) + $quote }; $script=Join-Path $env:CLAUDE_ZH_STAGE 'scripts\install_windows.ps1'; $args=@('-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File',(q $script),'-Interactive'); if ($env:CLAUDE_ZH_ORIGINAL_USER_SID) { $args += @('-OriginalUserSid',(q $env:CLAUDE_ZH_ORIGINAL_USER_SID)) }; if ($env:CLAUDE_ZH_ORIGINAL_USER_PROFILE) { $args += @('-OriginalUserProfile',(q $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE)) }; if ($env:CLAUDE_ZH_ORIGINAL_APPDATA) { $args += @('-OriginalAppData',(q $env:CLAUDE_ZH_ORIGINAL_APPDATA)) }; if ($env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA) { $args += @('-OriginalLocalAppData',(q $env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA)) }; if ($env:CLAUDE_ZH_CUSTOM_PATH) { $args += @('-ClaudePath',(q $env:CLAUDE_ZH_CUSTOM_PATH)) }; $log=Join-Path $env:CLAUDE_ZH_STAGE 'install-windows-launch.log'; @('script=' + $script, 'args=' + ($args -join ' '), 'started=' + (Get-Date).ToString('o')) | Set-Content -LiteralPath $log -Encoding UTF8; $proc=Start-Process -FilePath 'powershell.exe' -ArgumentList ($args -join ' ') -WorkingDirectory $env:CLAUDE_ZH_STAGE -Verb RunAs -PassThru -Wait -ErrorAction Stop; Add-Content -LiteralPath $log -Value ('exitCode=' + $proc.ExitCode) -Encoding UTF8; exit ([int]$proc.ExitCode) } catch { Write-Host $_.Exception.Message; exit 1 }"
-if errorlevel 1 (
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { function q($v) { $quote=[string][char]34; return $quote + ([string]$v).Replace($quote, ('\' + $quote)) + $quote }; $script=Join-Path $env:CLAUDE_ZH_STAGE 'scripts\install_windows.ps1'; $args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',(q $script),'-Interactive'); if ($env:CLAUDE_ZH_ORIGINAL_USER_SID) { $args += @('-OriginalUserSid',(q $env:CLAUDE_ZH_ORIGINAL_USER_SID)) }; if ($env:CLAUDE_ZH_ORIGINAL_USER_PROFILE) { $args += @('-OriginalUserProfile',(q $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE)) }; if ($env:CLAUDE_ZH_ORIGINAL_APPDATA) { $args += @('-OriginalAppData',(q $env:CLAUDE_ZH_ORIGINAL_APPDATA)) }; if ($env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA) { $args += @('-OriginalLocalAppData',(q $env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA)) }; if ($env:CLAUDE_ZH_CUSTOM_PATH) { $args += @('-ClaudePath',(q $env:CLAUDE_ZH_CUSTOM_PATH)) }; $logDir=Join-Path $env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA 'ClaudeDesktopZhCn\logs'; New-Item -ItemType Directory -Path $logDir -Force | Out-Null; $log=Join-Path $logDir 'install-windows-launch.log'; @('script=' + $script, 'args=' + ($args -join ' '), 'started=' + (Get-Date).ToString('o')) | Set-Content -LiteralPath $log -Encoding UTF8; try { $proc=Start-Process -FilePath 'powershell.exe' -ArgumentList ($args -join ' ') -WorkingDirectory $env:CLAUDE_ZH_STAGE -Verb RunAs -PassThru -Wait -ErrorAction Stop } catch { Write-Host $_.Exception.Message; Add-Content -LiteralPath $log -Value ('elevationFailed=' + $_.Exception.Message) -Encoding UTF8; exit 1223 }; Add-Content -LiteralPath $log -Value ('exitCode=' + $proc.ExitCode) -Encoding UTF8; exit ([int]$proc.ExitCode) } catch { Write-Host $_.Exception.Message; exit 1223 }"
+if errorlevel 1223 (
     echo.
     echo Failed to request administrator privileges.
     echo Common causes: UAC was cancelled, or the current user is not allowed to elevate.
@@ -53,9 +53,19 @@ if errorlevel 1 (
     pause >nul
     exit /b 1
 )
+if errorlevel 1 (
+    echo.
+    echo 安装器报告失败，详情见管理员窗口里的提示，或日志目录：
+    echo %CLAUDE_ZH_ORIGINAL_LOCALAPPDATA%\ClaudeDesktopZhCn\logs
+    echo 按任意键关闭此窗口。
+    pause >nul
+    exit /b 1
+)
 
-echo Administrator installer finished. Check the messages above or the log in:
-echo %CLAUDE_ZH_STAGE%\install-windows.log
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$stage=$env:CLAUDE_ZH_STAGE; $src=$env:CLAUDE_ZH_SOURCE; if ($stage -and (Test-Path -LiteralPath (Join-Path $stage '.cleanup-after-exit'))) { $stageFull=(Get-Item -LiteralPath $stage -Force).FullName.TrimEnd('\'); $srcFull=if ($src -and (Test-Path -LiteralPath $src)) { (Get-Item -LiteralPath $src -Force).FullName.TrimEnd('\') } else { '' }; if ($stageFull -ine $srcFull) { Remove-Item -LiteralPath $stageFull -Recurse -Force -ErrorAction SilentlyContinue } }"
+
+echo Administrator installer finished. Logs are kept in:
+echo %CLAUDE_ZH_ORIGINAL_LOCALAPPDATA%\ClaudeDesktopZhCn\logs
 echo.
 echo This window will stay open. Press any key to close it.
 pause >nul

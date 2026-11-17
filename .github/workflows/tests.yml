@@ -40,6 +40,7 @@ jobs:
           ./tests/Test-DesktopShell.ps1
           ./tests/Test-WriteAccess.ps1
           ./tests/Test-CoworkPatch.ps1
+          ./tests/Test-AppxFork.ps1
       - name: PowerShell 7 跨平台测试
         if: runner.os == 'Linux'
         shell: pwsh

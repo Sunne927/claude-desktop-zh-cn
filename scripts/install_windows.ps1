@@ -39,6 +39,9 @@ $script:InstallLogPath = $null
 $script:InstallTranscriptStarted = $false
 $script:PreInstallCleanupDone = $false
 $script:SkipFrontendFileBackups = $false
+$script:ClaudeProcessScopePaths = $null
+$script:ClaudeConfigPathsOverride = $null
+$script:AllowWindowsAppsWrite = $false
 
 $script:ExplicitClaudePath = ""
 if ($ClaudePath) { $script:ExplicitClaudePath = $ClaudePath }
@@ -50,10 +53,35 @@ if ($OriginalUserProfile) { $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE = $OriginalUser
 if ($OriginalAppData) { $env:CLAUDE_ZH_ORIGINAL_APPDATA = $OriginalAppData }
 if ($OriginalLocalAppData) { $env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA = $OriginalLocalAppData }
 
+function Get-InstallLogDirectory {
+    $localAppData = if ($env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA) {
+        $env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA
+    } else {
+        [Environment]::GetFolderPath('LocalApplicationData')
+    }
+    if ($localAppData) {
+        return (Join-Path $localAppData "ClaudeDesktopZhCn\logs")
+    }
+    return $null
+}
+
 function Start-InstallLog {
     try {
-        $root = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { (Get-Location).Path }
-        $script:InstallLogPath = Join-Path $root "install-windows.log"
+        # 日志不能放在 install-windows.bat 的暂存目录里：每次启动都会删掉重建暂存目录，
+        # 上一次失败的日志会被冲掉。
+        $logDir = Get-InstallLogDirectory
+        if ($logDir) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+            Get-ChildItem -LiteralPath $logDir -Filter "install-*.log" -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -Skip 30 |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+            $script:InstallLogPath = Join-Path $logDir ("install-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+        }
+        else {
+            $root = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { (Get-Location).Path }
+            $script:InstallLogPath = Join-Path $root "install-windows.log"
+        }
         Start-Transcript -Path $script:InstallLogPath -Force | Out-Null
         $script:InstallTranscriptStarted = $true
     }
@@ -464,25 +492,57 @@ function Get-ClaudeExeProductVersion {
     return "未知"
 }
 
-function Remove-LegacyAppxForkArtifacts {
-    $shortcutTargets = @()
+function Get-AppxForkShortcutFolders {
+    $folders = @()
     foreach ($folderName in @("Desktop", "CommonDesktopDirectory", "Programs", "CommonPrograms")) {
         $folder = [Environment]::GetFolderPath($folderName)
         if ($folder) {
-            $shortcutTargets += Join-Path $folder "Claude Desktop 中文补丁.lnk"
+            $folders += $folder
         }
     }
     if ($env:CLAUDE_ZH_ORIGINAL_USER_PROFILE) {
-        $shortcutTargets += Join-Path $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE "Desktop\Claude Desktop 中文补丁.lnk"
-        $shortcutTargets += Join-Path $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Claude Desktop 中文补丁.lnk"
+        $userProfile = $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE
+        $folders += Join-Path $userProfile "Desktop"
+        $folders += @(Get-ChildItem -LiteralPath $userProfile -Directory -Filter "OneDrive*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName "Desktop" })
+        $folders += Join-Path $userProfile "AppData\Roaming\Microsoft\Windows\Start Menu\Programs"
+        $folders += Join-Path $userProfile "AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
     }
-
-    foreach ($shortcutPath in @($shortcutTargets | Select-Object -Unique)) {
-        Remove-Item $shortcutPath -Force -ErrorAction SilentlyContinue
+    if ($env:APPDATA) {
+        $folders += Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
     }
+    return @($folders | Where-Object { $_ } | Select-Object -Unique)
+}
 
-    # 保留可写副本。当前版本会把 Microsoft Store 包复制到这里再打补丁，
-    # 如果每次安装前清掉副本，卸载和重新安装就无法复用同一份补丁状态。
+function Remove-LegacyAppxForkArtifacts {
+    param([string[]]$Folders = @(Get-AppxForkShortcutFolders))
+
+    # 按名字删安装器建的快捷方式；副本自己建的 Claude.lnk、用户改过名或固定到任务栏的，
+    # 按目标是否指向副本识别。
+    $shell = $null
+    foreach ($folder in @($Folders | Where-Object { $_ } | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $folder)) {
+            continue
+        }
+        foreach ($shortcut in @(Get-ChildItem -LiteralPath $folder -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue)) {
+            $remove = $shortcut.Name -eq "Claude Desktop 中文补丁.lnk"
+            if (-not $remove) {
+                try {
+                    if ($null -eq $shell) {
+                        $shell = New-Object -ComObject WScript.Shell
+                    }
+                    $remove = [string]$shell.CreateShortcut($shortcut.FullName).TargetPath -match '(?i)\\ClaudeDesktopZhCn\\appx-fork\\'
+                }
+                catch {
+                    $remove = $false
+                }
+            }
+            if ($remove) {
+                Remove-Item -LiteralPath $shortcut.FullName -Force -ErrorAction SilentlyContinue
+                Write-Host "  已删除快捷方式: $($shortcut.FullName)" -ForegroundColor Green
+            }
+        }
+    }
 }
 
 function New-AppxForkShortcut {
@@ -502,8 +562,16 @@ function New-AppxForkShortcut {
         return
     }
 
+    $desktop = Join-Path $profile "Desktop"
+    if ($profile.TrimEnd('\') -ieq ([string]$env:USERPROFILE).TrimEnd('\')) {
+        # 同一账户提权时用系统记录的真实桌面（可能被 OneDrive 重定向）。
+        $knownDesktop = [Environment]::GetFolderPath("Desktop")
+        if ($knownDesktop) {
+            $desktop = $knownDesktop
+        }
+    }
     $targets = @(
-        (Join-Path $profile "Desktop\Claude Desktop 中文补丁.lnk"),
+        (Join-Path $desktop "Claude Desktop 中文补丁.lnk"),
         (Join-Path $profile "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Claude Desktop 中文补丁.lnk")
     )
     $shell = New-Object -ComObject WScript.Shell
@@ -530,6 +598,138 @@ function Get-AppxForkRoot {
         return $null
     }
     return (Join-Path $localAppData "ClaudeDesktopZhCn\appx-fork")
+}
+
+function Get-AppxForkRoots {
+    # 卸载/清理要覆盖所有可能的位置：1.4.25~1.4.26 在提权账户与启动账户不同时，
+    # 会把副本建在提权账户自己的 LocalAppData 下。
+    $roots = @()
+    $primary = Get-AppxForkRoot
+    if ($primary) {
+        $roots += $primary
+    }
+    $elevated = [Environment]::GetFolderPath('LocalApplicationData')
+    if ($elevated) {
+        $roots += Join-Path $elevated "ClaudeDesktopZhCn\appx-fork"
+    }
+    return @($roots | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') } | Select-Object -Unique)
+}
+
+function Get-AppxForkProfilePath {
+    $root = Get-AppxForkRoot
+    if (-not $root) {
+        return $null
+    }
+    # 必须与 Get-AppxForkUserDataBootstrap 里运行时拼出的 %LOCALAPPDATA%\ClaudeDesktopZhCn\profile 一致。
+    return (Join-Path (Split-Path -Parent $root) "profile")
+}
+
+$script:AppxForkUserDataMarker = "/*claude-zh-cn:appx-fork-userdata*/"
+
+function Get-AppxForkUserDataBootstrap {
+    # 副本和原 Store 版默认用同一个数据目录（1p: %APPDATA%\Claude，3p: %LOCALAPPDATA%\Claude-3p），
+    # 原版在运行时副本拿不到单实例锁会立刻退出。正式包启动早期会删掉外部传入的
+    # CLAUDE_USER_DATA_DIR，所以在入口最前面设置它并挡住这次删除。
+    return $script:AppxForkUserDataMarker + ';(function(){if(process.platform!=="win32"||!process.env.LOCALAPPDATA)return;var d=process.env.LOCALAPPDATA+"\\ClaudeDesktopZhCn\\profile",t=process.env;t.CLAUDE_USER_DATA_DIR=d;process.env=new Proxy(t,{deleteProperty:function(o,k){return k==="CLAUDE_USER_DATA_DIR"&&o[k]===d?true:Reflect.deleteProperty(o,k)}})})();'
+}
+
+function Set-AppxForkUserDataIsolation {
+    param([string]$ResourcesPath)
+
+    $asarPath = Join-Path $ResourcesPath "app.asar"
+    if (-not (Test-Path -LiteralPath $asarPath -PathType Leaf)) {
+        throw "Store 副本缺少 app.asar，无法隔离副本数据目录: $asarPath"
+    }
+
+    $parsed = Read-AsarHeaderFromFile $asarPath
+    $package = [Text.Encoding]::UTF8.GetString((Read-AsarEntryBytes $asarPath $parsed "package.json")) | ConvertFrom-Json
+    $entry = ([string]$package.main) -replace '\\', '/' -replace '^\./', ''
+    if (-not $entry) {
+        throw "app.asar 的 package.json 没有 main 字段，无法隔离副本数据目录。"
+    }
+
+    $sourceBytes = Read-AsarEntryBytes $asarPath $parsed $entry
+    $source = [Text.Encoding]::UTF8.GetString($sourceBytes)
+    if ($source.Contains($script:AppxForkUserDataMarker)) {
+        Write-Host "  副本已使用独立数据目录" -ForegroundColor DarkGray
+        return
+    }
+    if (-not $source.Contains("CLAUDE_USER_DATA_DIR")) {
+        throw "当前 Claude 版本的启动代码已不识别 CLAUDE_USER_DATA_DIR，副本无法与原 Store 版隔离（会一打开就退出），已中止安装。"
+    }
+
+    # 插在开头的 "use strict"; 之后，保持入口文件的严格模式不变。
+    $insertAt = 0
+    $directive = [regex]::Match($source, '^\uFEFF?\s*(["''])use strict\1;?')
+    if ($directive.Success) {
+        $insertAt = [Text.Encoding]::UTF8.GetByteCount($source.Substring(0, $directive.Length))
+    }
+    $bootstrapBytes = [Text.UTF8Encoding]::new($false).GetBytes((Get-AppxForkUserDataBootstrap))
+    $patched = [byte[]]::new($sourceBytes.Length + $bootstrapBytes.Length)
+    [Array]::Copy($sourceBytes, 0, $patched, 0, $insertAt)
+    [Array]::Copy($bootstrapBytes, 0, $patched, $insertAt, $bootstrapBytes.Length)
+    [Array]::Copy($sourceBytes, $insertAt, $patched, $insertAt + $bootstrapBytes.Length, $sourceBytes.Length - $insertAt)
+
+    Set-AsarEntryContent -AsarPath $asarPath -ResourcesPath $ResourcesPath -EntryPath $entry -Content $patched
+    Sync-ClaudeExeAsarIntegrity $ResourcesPath
+    Write-Host "  副本已改用独立数据目录，可与原 Store 版同时运行: $(Get-AppxForkProfilePath)" -ForegroundColor Green
+}
+
+function Initialize-AppxForkProfile {
+    $profilePath = Get-AppxForkProfilePath
+    if (-not $profilePath) {
+        return
+    }
+    if (Test-Path -LiteralPath $profilePath) {
+        Write-Host "  已复用副本数据目录: $profilePath" -ForegroundColor DarkGray
+        return
+    }
+
+    $localAppData = Split-Path -Parent (Split-Path -Parent $profilePath)
+    $appData = if ($env:CLAUDE_ZH_ORIGINAL_APPDATA) { $env:CLAUDE_ZH_ORIGINAL_APPDATA } else { $env:APPDATA }
+    $sourceDirs = @((Join-Path $localAppData "Claude-3p"))
+    if ($appData) {
+        $sourceDirs += Join-Path $appData "Claude-3p"
+        $sourceDirs += Join-Path $appData "Claude"
+    }
+    $sourceDir = $sourceDirs | Where-Object {
+        (Test-Path -LiteralPath (Join-Path $_ "configLibrary")) -or (Test-Path -LiteralPath (Join-Path $_ "config.json"))
+    } | Select-Object -First 1
+
+    New-Item -ItemType Directory -Path $profilePath -Force | Out-Null
+    if (-not $sourceDir) {
+        Write-Host "  已创建副本数据目录（首次打开需重新配置）: $profilePath" -ForegroundColor Green
+        return
+    }
+
+    # 只带走第三方 API 配置和应用设置；会话、缓存、登录状态仍留在原 Store 版的数据目录里。
+    $items = @("configLibrary", "config.json", "claude_desktop_config.json", "developer_settings.json",
+        "extensions-installations.json", "Claude Extensions Settings")
+    foreach ($item in $items) {
+        $source = Join-Path $sourceDir $item
+        if (-not (Test-Path -LiteralPath $source)) {
+            continue
+        }
+        try {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $profilePath $item) -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Host "  [提示] 未能复制 $item 到副本数据目录: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
+    }
+    Write-Host "  已创建副本数据目录，并从 $sourceDir 带入现有配置: $profilePath" -ForegroundColor Green
+}
+
+function Remove-AppxForkTemporaryDirectories {
+    foreach ($root in @(Get-AppxForkRoots)) {
+        if (-not (Test-Path -LiteralPath $root)) {
+            continue
+        }
+        foreach ($directory in @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like ".*.copying-*" -or $_.Name -like ".*.removing-*" })) {
+            Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Get-AppxForkCandidates {
@@ -640,6 +840,7 @@ function Copy-AppxInstallToWritablePath {
         throw "无法确定当前用户的 LocalAppData 目录，无法创建 Store 可写副本。"
     }
     New-Item -ItemType Directory -Path $root -Force | Out-Null
+    Remove-AppxForkTemporaryDirectories
 
     $leaf = Split-Path -Leaf $SourcePath
     $destination = Join-Path $root $leaf
@@ -697,7 +898,7 @@ function Copy-AppxInstallToWritablePath {
         CreatedAt = (Get-Date).ToString('o')
     }
     $metadata | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Get-AppxForkMetadataPath $staging) -Encoding UTF8
-    Move-Item -LiteralPath $staging -Destination $destination -Force
+    [IO.Directory]::Move($staging, $destination)
     Write-Host "  Store 可写副本已创建: $destination" -ForegroundColor Green
     return $destination
 }
@@ -709,14 +910,88 @@ function Remove-AppxForkDirectory {
         return
     }
 
-    $root = [System.IO.Path]::GetFullPath((Get-AppxForkRoot)).TrimEnd('\') + '\'
     $target = [System.IO.Path]::GetFullPath($ForkPath).TrimEnd('\') + '\'
-    if (-not $target.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $insideRoot = @(Get-AppxForkRoots | Where-Object {
+            $target.StartsWith($_ + '\', [System.StringComparison]::OrdinalIgnoreCase)
+        }).Count -gt 0
+    if (-not $insideRoot) {
         throw "拒绝删除 Store 副本目录之外的路径: $ForkPath"
     }
 
-    Remove-Item -LiteralPath $ForkPath -Recurse -Force -ErrorAction Stop
-    Write-Host "  已删除 Store 可写副本，原 Microsoft Store 包未改动。" -ForegroundColor Green
+    # 先整体改名再删：目录里有文件被占用时改名会直接失败，副本保持完整；
+    # 直接 Remove-Item 会删掉一半，留下快捷方式指向的残缺副本，一打开就闪退。
+    $parent = Split-Path -Parent $target.TrimEnd('\')
+    $leaf = Split-Path -Leaf $target.TrimEnd('\')
+    $removing = Join-Path $parent (".$leaf.removing-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    # 不能用 Move-Item：Windows PowerShell 5.1 改目录名失败时会退回成「复制再删除」，
+    # 反而留下半份副本。Directory.Move 只做原子改名，失败就什么都不动。
+    $moved = $false
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 5 -and -not $moved; $attempt++) {
+        try {
+            [IO.Directory]::Move($target.TrimEnd('\'), $removing)
+            $moved = $true
+        }
+        catch {
+            $lastError = $_.Exception
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    if (-not $moved) {
+        throw "无法删除 Store 副本 $ForkPath：其中仍有文件被占用。请先关闭「Claude Desktop 中文补丁」（任务管理器里结束路径在 appx-fork 下的 Claude.exe）后重试。副本未被改动。原始错误：$($lastError.Message)"
+    }
+
+    Remove-Item -LiteralPath $removing -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $removing) {
+        Write-Host "  [提示] 副本已停用，残留临时目录下次运行时清理: $removing" -ForegroundColor DarkYellow
+    }
+    Write-Host "  已删除 Store 可写副本: $ForkPath（原 Microsoft Store 包未改动）" -ForegroundColor Green
+}
+
+function Get-AppxForkDirectories {
+    $directories = @()
+    foreach ($root in @(Get-AppxForkRoots)) {
+        if (-not (Test-Path -LiteralPath $root)) {
+            continue
+        }
+        $directories += @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.Name.StartsWith(".") } |
+            ForEach-Object { $_.FullName })
+    }
+    return @($directories)
+}
+
+function Remove-StaleAppxForks {
+    param([string]$KeepPath)
+
+    foreach ($forkPath in @(Get-AppxForkDirectories)) {
+        if ($KeepPath -and ($forkPath.TrimEnd('\') -ieq $KeepPath.TrimEnd('\'))) {
+            continue
+        }
+        try {
+            Remove-AppxForkDirectory $forkPath
+        }
+        catch {
+            Write-Host "  [提示] 旧副本暂时删不掉，下次安装时再清理: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
+    }
+}
+
+function Test-StoreForkTarget {
+    param(
+        [string]$InstallKind,
+        [string]$ResourcesPath
+    )
+    return ($InstallKind -eq "AppXFork" -or
+        ($InstallKind -eq "AppX" -and $ResourcesPath -match '(?i)\\WindowsApps\\'))
+}
+
+function Enter-AppxForkScope {
+    $script:ClaudeProcessScopePaths = @(Get-AppxForkRoots | ForEach-Object { $_ + '\' })
+    $profilePath = Get-AppxForkProfilePath
+    if ($profilePath) {
+        $script:ClaudeConfigPathsOverride = @(Join-Path $profilePath "config.json")
+    }
 }
 
 function Get-ClaudeResourcesPath {
@@ -853,6 +1128,10 @@ function Get-ClaudeResourcesPath {
 }
 
 function Get-ClaudeConfigPaths {
+    if ($script:ClaudeConfigPathsOverride) {
+        return @($script:ClaudeConfigPathsOverride)
+    }
+
     $appDataRoots = @()
     $localAppDataRoots = @()
     if ($env:CLAUDE_ZH_ORIGINAL_APPDATA) {
@@ -1248,7 +1527,7 @@ function Get-LanguageResources {
 function Enable-WriteAccess {
     param([string]$ResourcesPath)
 
-    if ($ResourcesPath -match '(?i)\\WindowsApps\\') {
+    if ($ResourcesPath -match '(?i)\\WindowsApps\\' -and -not $script:AllowWindowsAppsWrite) {
         # 原始 Microsoft Store 包保持不可写，避免卸载或异常路径触发 takeown/icacls。
         # 正常安装流程会先复制到用户目录，再从副本进入这里。
         Write-Host "  [权限] 检测到原始 Microsoft Store 包，跳过 ACL 修改。" -ForegroundColor DarkYellow
@@ -4409,7 +4688,15 @@ function Test-ClaudeDesktopProcessPath {
     if (-not $Path) {
         return $false
     }
+    # 处理 Store 副本时只认当前用户的副本进程：原 Store 版（可能属于别的 Windows 账户）
+    # 与副本互不影响，不能被一起结束。
+    if ($script:ClaudeProcessScopePaths) {
+        return @($script:ClaudeProcessScopePaths | Where-Object {
+                $Path.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase)
+            }).Count -gt 0
+    }
     return ($Path -match "(?i)WindowsApps\\.*Claude" -or
+            $Path -match "(?i)\\ClaudeDesktopZhCn\\appx-fork\\" -or
             $Path -match "(?i)AnthropicClaude\\app-" -or
             $Path -match "(?i)scoop\\apps\\(?:claude|claude-desktop)" -or
             ($script:ExplicitClaudePath -and $Path.StartsWith($script:ExplicitClaudePath, [System.StringComparison]::OrdinalIgnoreCase)) -or
@@ -4536,7 +4823,10 @@ function Stop-ClaudeProcessesGracefully {
     }
 
     # cowork-svc.exe 不叫 claude.exe，旧逻辑不会停它；恢复/覆盖 app.asar 时它可能继续占用资源。
-    Stop-CoworkVMService
+    # Store 副本不使用 CoworkVMService（服务属于原 Store 包、全机共用），不能去停它。
+    if (-not $script:ClaudeProcessScopePaths) {
+        Stop-CoworkVMService
+    }
     $coworkProcs = @(Get-ClaudeCoworkProcesses)
     if ($coworkProcs.Count -gt 0) {
         foreach ($proc in $coworkProcs) {
@@ -4587,7 +4877,7 @@ function Stop-ClaudeProcesses {
 function Restart-Claude {
     param([string]$ClaudePath)
 
-    Stop-ClaudeProcesses
+    $null = Stop-ClaudeProcesses
 
     # 仅对 AppX(MSIX) 安装优先用包激活启动: 进程带包身份, 更新检查走 msix 路径
     # (直接启动 exe 会被更新器误判为 Squirrel 解包安装而报 "Can not find Squirrel",
@@ -4639,14 +4929,15 @@ function Install-WindowsLanguagePack {
         Write-Step "[1/7] 检查语言资源"
         $pack = Get-LanguageResources $LanguageCode
 
-        Write-Step "关闭 Claude Desktop"
-        Stop-ClaudeProcesses -RequireStopped
-
         Write-Step "[2/7] 查找 Claude Desktop"
         $paths = Get-ClaudeResourcesPath
         $claudePath = $paths["App"]
         $resourcesPath = $paths["Resources"]
         $installKind = $paths["InstallKind"]
+        $storeFork = Test-StoreForkTarget $installKind $resourcesPath
+        if ($storeFork) {
+            Enter-AppxForkScope
+        }
         Write-Host "  app: $claudePath" -ForegroundColor Green
         Write-Host "  resources: $resourcesPath" -ForegroundColor Green
         if ($installKind -eq "AppX") {
@@ -4670,9 +4961,14 @@ function Install-WindowsLanguagePack {
         # 的半坏状态，这里在结构不兼容时零副作用地快速失败。
         Assert-ClaudeExeIntegrityMarkers $resourcesPath
 
+        Write-Step "关闭 Claude Desktop"
+        if ($storeFork) {
+            Write-Host "  只关闭当前用户的中文副本；原 Store 版和其他账户的 Claude 不受影响。" -ForegroundColor DarkGray
+        }
+        $null = Stop-ClaudeProcesses -RequireStopped
+
         Write-Step "修复桌面 Claude 快捷方式"
-        if ($installKind -eq "AppXFork" -or
-            ($installKind -eq "AppX" -and $resourcesPath -match '(?i)\\WindowsApps\\')) {
+        if ($storeFork) {
             Write-Host "  [跳过] Store 可写副本不使用原 AppX 快捷方式，安装完成后将直接启动副本。" -ForegroundColor DarkGray
         }
         else {
@@ -4680,7 +4976,7 @@ function Install-WindowsLanguagePack {
         }
 
         Write-Step "[3/7] 准备写入权限"
-        if ($installKind -eq "AppX" -and $resourcesPath -match '(?i)\\WindowsApps\\') {
+        if ($installKind -eq "AppX" -and $storeFork) {
             # Store/MSIX 的 WindowsApps 目录受 Process Trust Label 保护，
             # 接管 ACL 也不能可靠地改写原包。复制到当前用户目录后再打补丁，
             # 由本地 Claude.exe 直接运行，原 Store 包保持完整并可继续更新。
@@ -4718,6 +5014,9 @@ function Install-WindowsLanguagePack {
         }
         $null = Stop-ClaudeProcesses -RequireStopped
         Patch-DesktopShellLocale $resourcesPath $LanguageCode
+        if ($installKind -eq "AppXFork") {
+            Set-AppxForkUserDataIsolation $resourcesPath
+        }
         Complete-FrontendPatchTarget $patchTarget
         Close-FrontendPatchTarget $patchTarget
         $usedAsarFrontend = $patchTarget.Mode -eq "Asar"
@@ -4727,15 +5026,24 @@ function Install-WindowsLanguagePack {
         Patch-CoworkService $resourcesPath $appVersion
 
         Write-Step "[7/7] 写入用户语言配置"
+        if ($installKind -eq "AppXFork") {
+            Initialize-AppxForkProfile
+        }
         Set-ClaudeLocale $LanguageCode
+
+        if ($installKind -eq "AppXFork") {
+            Write-Step "创建中文副本快捷方式"
+            New-AppxForkShortcut $claudePath
+            Remove-StaleAppxForks -KeepPath $claudePath
+        }
 
         Write-Step "重启 Claude Desktop"
         Restart-Claude $claudePath
 
         if ($installKind -eq "AppXFork") {
-            New-AppxForkShortcut $claudePath
             Write-Step "跳过 CoworkVMService"
-            Write-Host "  [提示] Store 可写副本以普通桌面程序启动，Cowork/沙箱功能可能仍需从原 Store 版启动。" -ForegroundColor DarkYellow
+            Write-Host "  [提示] 中文副本以普通桌面程序运行，与原 Store 版分开保存数据；Cowork/沙箱、自动更新、claude:// 登录回调仍属于原 Store 版。" -ForegroundColor DarkYellow
+            Write-Host "  [提示] 请从桌面或开始菜单的「Claude Desktop 中文补丁」打开中文版；开始菜单里原来的 Claude 仍是英文原版。" -ForegroundColor DarkYellow
         }
         else {
             Write-Step "启动 CoworkVMService"
@@ -4773,17 +5081,35 @@ function Install-WindowsLanguagePack {
 function Uninstall-WindowsLanguagePack {
     Write-Host "=== Claude Desktop Windows 中文补丁卸载 ===" -ForegroundColor Cyan
 
-    $paths = Get-ClaudeResourcesPath
-    $claudePath = $paths["App"]
-    $resourcesPath = $paths["Resources"]
-    $installKind = $paths["InstallKind"]
-
     # 旧版本提供过 Frida 常驻模式，相关脚本已移除。这里只做一次性兜底清理，
     # 让从旧版升级的用户不会残留计划任务和便携运行时。
     Remove-LegacyFridaResident
 
+    try {
+        $paths = Get-ClaudeResourcesPath
+    }
+    catch {
+        # 原 Claude 已被卸载时也要能清掉副本、快捷方式和历史残留。
+        Write-Host "  [提示] 未找到可用的 Claude 安装（$($_.Exception.Message)），只清理中文副本和残留文件。" -ForegroundColor DarkYellow
+        Uninstall-AppxForks
+        return
+    }
+    $claudePath = $paths["App"]
+    $resourcesPath = $paths["Resources"]
+    $installKind = $paths["InstallKind"]
+
+    if ((Test-StoreForkTarget $installKind $resourcesPath) -and
+        -not ($installKind -eq "AppX" -and (Test-Path -LiteralPath (Get-BackupRoot $resourcesPath)))) {
+        Uninstall-AppxForks
+        return
+    }
+    if ($resourcesPath -match '(?i)\\WindowsApps\\') {
+        # 1.4.24 及以前直接改写过官网 MSIX 原包，备份就在包里，恢复时必须允许写入。
+        $script:AllowWindowsAppsWrite = $true
+    }
+
     Write-Step "关闭 Claude Desktop"
-    Stop-ClaudeProcesses -RequireStopped
+    $null = Stop-ClaudeProcesses -RequireStopped
     Remove-LegacyAppxForkArtifacts
 
     # 卸载路径同样要写回备份、重同步 exe 哈希，所以也得先把权限拿到。
@@ -4832,12 +5158,332 @@ function Uninstall-WindowsLanguagePack {
     Write-Step "[4/4] 恢复用户语言配置"
     Set-ClaudeLocale "en-US"
 
-    if ($installKind -eq "AppXFork") {
-        Remove-AppxForkDirectory $claudePath
+    if ($resourcesPath -match '(?i)\\WindowsApps\\') {
+        Write-Step "还原 WindowsApps 包的所有者和权限"
+        Restore-ClaudePackageAcl
+    }
+    if (@(Get-AppxForkDirectories).Count -gt 0) {
+        Write-Step "清理 Microsoft Store 中文副本"
+        Uninstall-AppxForks
+        return
     }
 
     Write-Host ""
     Write-Host "卸载完成。请重启 Claude Desktop 使更改生效。" -ForegroundColor Green
+}
+
+function Uninstall-AppxForks {
+    param([switch]$ForReinstall)
+
+    # 原 Store 包的程序文件从未被这套方案改写；卸载要清掉副本、快捷方式、副本数据，
+    # 以及历史版本留下的语言配置、WindowsApps 权限改动和安装器临时目录。
+    Enter-AppxForkScope
+    $total = if ($ForReinstall) { 4 } else { 8 }
+
+    Write-Step "[1/$total] 关闭中文副本"
+    $null = Stop-ClaudeProcesses -RequireStopped
+
+    Write-Step "[2/$total] 删除中文副本快捷方式"
+    Remove-LegacyAppxForkArtifacts
+
+    Write-Step "[3/$total] 删除中文副本"
+    $forks = @(Get-AppxForkDirectories)
+    if ($forks.Count -eq 0) {
+        Write-Host "  未找到中文副本，无需删除。" -ForegroundColor DarkGray
+    }
+    foreach ($forkPath in $forks) {
+        Remove-AppxForkDirectory $forkPath
+    }
+    Remove-AppxForkTemporaryDirectories
+
+    Write-Step "[4/$total] 清理副本写入的注册表项"
+    Remove-AppxForkRegistryLeftovers
+    if ($ForReinstall) {
+        return
+    }
+
+    Write-Step "[5/$total] 删除中文副本数据"
+    Remove-AppxForkProfile
+
+    Write-Step "[6/$total] 恢复原 Store 版语言配置"
+    Restore-StoreClaudeLocale
+
+    Write-Step "[7/$total] 还原 Store 原包的所有者和权限"
+    Restore-ClaudePackageAcl
+
+    Write-Step "[8/$total] 清理安装器临时文件"
+    Remove-InstallerLeftovers
+
+    Write-Host ""
+    Write-Host "卸载完成。原 Microsoft Store 版 Claude 可继续从开始菜单使用。" -ForegroundColor Green
+    $logDir = Get-InstallLogDirectory
+    if ($logDir) {
+        Write-Host "仅保留安装日志（排查问题用，可手动删除）: $logDir" -ForegroundColor DarkGray
+    }
+}
+
+function Remove-AppxForkProfile {
+    $profilePath = Get-AppxForkProfilePath
+    if (-not $profilePath -or -not (Test-Path -LiteralPath $profilePath)) {
+        Write-Host "  未找到中文副本数据目录。" -ForegroundColor DarkGray
+        return
+    }
+
+    if ($Interactive) {
+        while ($true) {
+            $choice = (Read-Host "是否同时删除中文副本的数据（副本里的会话记录和配置，原 Store 版的数据不受影响）？[Y=删除 / n=保留]").Trim()
+            if ($choice -eq "" -or $choice -match '^[Yy]$') {
+                break
+            }
+            if ($choice -match '^[Nn]$') {
+                Write-Host "  已保留: $profilePath" -ForegroundColor DarkGray
+                return
+            }
+            Write-Host "请输入 y 或 n。" -ForegroundColor Yellow
+        }
+    }
+
+    Remove-Item -LiteralPath $profilePath -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $profilePath) {
+        Write-Host "  [警告] 副本数据目录未能完全删除，请手动删除: $profilePath" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "  已删除中文副本数据目录: $profilePath" -ForegroundColor Green
+    }
+}
+
+function Restore-StoreClaudeLocale {
+    # 1.4.24 及以前、1.4.25~1.4.28 会把中文 locale 写进原 Store 版的配置，
+    # 其中一部分 config.json（连同所在目录）是安装器新建的。
+    $savedOverride = $script:ClaudeConfigPathsOverride
+    $script:ClaudeConfigPathsOverride = $null
+    try {
+        $configPaths = @(Get-ClaudeConfigPaths)
+    }
+    finally {
+        $script:ClaudeConfigPathsOverride = $savedOverride
+    }
+
+    $changed = 0
+    foreach ($configPath in $configPaths) {
+        if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+            continue
+        }
+        try {
+            $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        }
+        catch {
+            continue
+        }
+        if ($null -eq $config -or -not $config.PSObject.Properties["locale"]) {
+            continue
+        }
+
+        # 只有 locale 一个键的 config.json 是安装/卸载时新建的空壳（应用自己写的配置还有别的键），
+        # 包括旧版卸载写入的 {"locale":"en-US"}。
+        if (@($config.PSObject.Properties).Count -eq 1) {
+            Remove-Item -LiteralPath $configPath -Force -ErrorAction SilentlyContinue
+            $parent = Split-Path -Parent $configPath
+            if (@(Get-ChildItem -LiteralPath $parent -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+                Remove-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "  已删除安装器创建的配置: $configPath" -ForegroundColor Green
+        }
+        elseif ([string]$config.locale -match '^zh-(CN|TW|HK)$') {
+            $config.locale = "en-US"
+            Save-JsonNoBom $configPath $config
+            Write-Host "  locale=en-US: $configPath" -ForegroundColor Green
+        }
+        else {
+            continue
+        }
+        $changed++
+    }
+    if ($changed -eq 0) {
+        Write-Host "  原 Store 版配置里没有补丁写入的中文语言设置。" -ForegroundColor DarkGray
+    }
+}
+
+function Get-ClaudePackageInstallLocations {
+    $locations = @()
+    try {
+        $locations += @(Get-AppxPackage -AllUsers -ErrorAction Stop |
+            Where-Object { ($_.Name -like "*Claude*") -or ($_.Publisher -like "*Anthropic*") } |
+            ForEach-Object { $_.InstallLocation })
+    }
+    catch {
+        $locations += @(Get-ClaudeAppxPackages | ForEach-Object { $_.InstallLocation })
+    }
+    return @($locations | Where-Object {
+            $_ -and $_ -match '(?i)\\WindowsApps\\' -and (Test-Path -LiteralPath $_)
+        } | Select-Object -Unique)
+}
+
+function Test-PackageItemAclModified {
+    param([string]$Path)
+
+    $acl = Get-Acl -LiteralPath $Path
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne "S-1-5-18") {
+        return $true
+    }
+    return @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])).Count -gt 0
+}
+
+function Restore-ClaudePackageAcl {
+    # 1.4.24 及以前会对 WindowsApps 里的 Claude 包执行 takeown + icacls/Set-Acl：所有者改成
+    # Administrators，并给 Administrators 和当时的用户加显式完全控制（所有共用这个包的账户都受影响）。
+    # 正常 MSIX 包里这些目录和文件的所有者是 SYSTEM、没有显式权限，这里还原成这个状态。
+    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Host "  [提示] 未以管理员身份运行，跳过权限检查。" -ForegroundColor DarkYellow
+        return
+    }
+
+    $found = $false
+    foreach ($location in @(Get-ClaudePackageInstallLocations)) {
+        $app = Join-Path $location "app"
+        if (-not (Test-Path -LiteralPath $app)) {
+            continue
+        }
+        $probes = @(
+            $app,
+            (Join-Path $app "resources"),
+            (Join-Path $app "Claude.exe"),
+            (Join-Path $app "resources\app.asar"),
+            (Join-Path $app "resources\ion-dist.asar"),
+            (Join-Path $app "resources\cowork-svc.exe")
+        ) | Where-Object { Test-Path -LiteralPath $_ }
+        if (@($probes | Where-Object { Test-PackageItemAclModified $_ }).Count -eq 0) {
+            continue
+        }
+
+        $found = $true
+        Write-Host "  检测到旧版本改过权限，正在还原: $app" -ForegroundColor Yellow
+        $resetOutput = & icacls.exe $app /reset /T /C /Q 2>&1
+        $ownerOutput = & icacls.exe $app /setowner "*S-1-5-18" /T /C /Q 2>&1
+        $remaining = @($probes | Where-Object { Test-PackageItemAclModified $_ })
+        if ($remaining.Count -eq 0) {
+            Write-Host "  已还原为 MSIX 默认权限（所有者 SYSTEM，无额外授权）" -ForegroundColor Green
+        }
+        else {
+            Write-Host "  [警告] 以下位置的权限未能完全还原：" -ForegroundColor Yellow
+            foreach ($path in $remaining) {
+                Write-Host "         $path" -ForegroundColor DarkYellow
+            }
+            Write-Host "         icacls: $(($resetOutput + $ownerOutput) -join ' ')" -ForegroundColor DarkGray
+        }
+    }
+    if (-not $found) {
+        Write-Host "  Store 原包权限正常，无需还原。" -ForegroundColor DarkGray
+    }
+}
+
+function Get-OriginalUserRegistryRoot {
+    $sid = [string]$env:CLAUDE_ZH_ORIGINAL_USER_SID
+    if ($sid) {
+        $root = "Registry::HKEY_USERS\$sid"
+        if (Test-Path -LiteralPath $root) {
+            return $root
+        }
+    }
+    return "Registry::HKEY_CURRENT_USER"
+}
+
+function Remove-AppxForkRegistryLeftovers {
+    param([string]$RegistryRoot = (Get-OriginalUserRegistryRoot))
+
+    # 副本以普通程序运行时会把自己登记成 claude:// 处理程序、通知激活 COM 服务器，
+    # 开了「开机启动」还会写 Run 项。副本删掉后这些都成了死链接，claude:// 会打不开。
+    $pattern = '(?i)\\ClaudeDesktopZhCn\\appx-fork\\'
+    $removed = 0
+
+    $protocolCommand = Join-Path $RegistryRoot "Software\Classes\claude\shell\open\command"
+    if (Test-Path -LiteralPath $protocolCommand) {
+        $command = [string](Get-Item -LiteralPath $protocolCommand).GetValue("")
+        if ($command -match $pattern) {
+            Remove-Item -LiteralPath (Join-Path $RegistryRoot "Software\Classes\claude") -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "  已移除副本注册的 claude:// 协议（交还原 Store 版）" -ForegroundColor Green
+            $removed++
+        }
+    }
+
+    $clsidRoot = Join-Path $RegistryRoot "Software\Classes\CLSID"
+    foreach ($clsid in @(Get-ChildItem -LiteralPath $clsidRoot -ErrorAction SilentlyContinue)) {
+        $server = Join-Path $clsid.PSPath "LocalServer32"
+        if (-not (Test-Path -LiteralPath $server)) {
+            continue
+        }
+        if ([string](Get-Item -LiteralPath $server).GetValue("") -match $pattern) {
+            Remove-Item -LiteralPath $clsid.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "  已移除副本注册的 COM 组件: $($clsid.PSChildName)" -ForegroundColor Green
+            $removed++
+        }
+    }
+
+    $runKey = Join-Path $RegistryRoot "Software\Microsoft\Windows\CurrentVersion\Run"
+    $approvedKey = Join-Path $RegistryRoot "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+    if (Test-Path -LiteralPath $runKey) {
+        $run = Get-Item -LiteralPath $runKey
+        foreach ($name in @($run.GetValueNames())) {
+            if ([string]$run.GetValue($name) -notmatch $pattern) {
+                continue
+            }
+            Remove-ItemProperty -LiteralPath $runKey -Name $name -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $approvedKey) {
+                Remove-ItemProperty -LiteralPath $approvedKey -Name $name -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "  已移除副本的开机启动项: $name" -ForegroundColor Green
+            $removed++
+        }
+    }
+
+    if ($removed -eq 0) {
+        Write-Host "  注册表里没有副本留下的条目。" -ForegroundColor DarkGray
+    }
+}
+
+function Remove-InstallerLeftovers {
+    $current = $null
+    if ($PSScriptRoot) {
+        $current = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)).TrimEnd('\')
+    }
+
+    $candidates = @()
+    foreach ($localAppData in @($env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA, [Environment]::GetFolderPath('LocalApplicationData'))) {
+        if (-not $localAppData) {
+            continue
+        }
+        $candidates += Join-Path $localAppData "ClaudeDesktopZhCnInstaller"
+        $candidates += Join-Path $localAppData "Temp\ClaudeDesktopZhCnInstaller"
+    }
+    $candidates += Join-Path ([IO.Path]::GetTempPath()) "ClaudeDesktopZhCnInstaller"
+
+    $removed = 0
+    foreach ($candidate in @($candidates | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') } | Select-Object -Unique)) {
+        if (($current -and $candidate -ieq $current) -or -not (Test-Path -LiteralPath $candidate)) {
+            continue
+        }
+        Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $candidate)) {
+            Write-Host "  已删除: $candidate" -ForegroundColor Green
+            $removed++
+        }
+    }
+
+    foreach ($root in @(Get-AppxForkRoots)) {
+        if ((Test-Path -LiteralPath $root) -and @(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+            Remove-Item -LiteralPath $root -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($current -and $current -match '(?i)\\ClaudeDesktopZhCnInstaller$') {
+        # 正在运行的暂存目录由 install-windows.bat 在管理员窗口关闭后删除。
+        Set-Content -LiteralPath (Join-Path $current ".cleanup-after-exit") -Value "uninstall" -ErrorAction SilentlyContinue
+        Write-Host "  当前安装器目录会在关闭此窗口后自动删除: $current" -ForegroundColor DarkGray
+    }
+    elseif ($removed -eq 0) {
+        Write-Host "  没有需要清理的安装器临时文件。" -ForegroundColor DarkGray
+    }
 }
 
 function Remove-LegacyFridaResident {
@@ -4888,6 +5534,16 @@ function Invoke-PreInstallCleanup {
 
     $paths = Get-ClaudeResourcesPath
     $resourcesPath = $paths["Resources"]
+    if (Test-StoreForkTarget $paths["InstallKind"] $resourcesPath) {
+        if (@(Get-AppxForkDirectories).Count -eq 0) {
+            Write-Host "  未找到旧中文副本，跳过预卸载。" -ForegroundColor DarkYellow
+            return
+        }
+        Write-Host "  删除旧中文副本后重新生成（副本数据目录保留）。" -ForegroundColor DarkGray
+        Uninstall-AppxForks -ForReinstall
+        return
+    }
+
     $backupRoot = Get-BackupRoot $resourcesPath
     $backup = $null
     if (Test-Path $backupRoot) {
