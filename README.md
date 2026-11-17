@@ -92,7 +92,7 @@ CC Switch skills 同步会扫描 `~/.cc-switch/skills` 下包含 `SKILL.md` 的�
 2. 下载或克隆本项目。
 3. 双击 `install-windows.bat`；脚本会复制安装文件到当前用户的临时目录，并弹出 UAC 管理员授权窗口。
 4. 先选择操作：
-   - `1` 安装中文补丁（第三方 API 模式，例如 DeepSeek）：安装中文资源、注册中文语言并汉化前端 bundle 与主进程菜单。脚本会在必要时就地改写 `app.asar` 补入桌面词库；Claude `4.29+` 会重建 `ion-dist.asar` 并更新 `Claude.exe` 中对应的完整性哈希，原有 Authenticode 签名会失效；同时脚本会自动修补 `cowork-svc.exe` 的客户端签名校验分支，彻底解决 Cowork 工作区因签名失效报 `RPC pipe closed` 的问题（卸载时自动恢复补丁副本中的原文件）。安装后 `English` 界面同样会显示中文（词库被合并覆盖进 `en-US`），切换语言无法回到纯英文，需要卸载或恢复备份才能还原。若 Claude 来自 Microsoft Store，脚本会在 `%LOCALAPPDATA%\ClaudeDesktopZhCn\appx-fork` 创建可写副本，只修改并启动副本，不接管原 `WindowsApps` 目录。第三方模型需在网关或 CC Switch 中映射为 Claude/Anthropic 风格名称。
+   - `1` 安装中文补丁（第三方 API 模式，例如 DeepSeek）：安装中文资源、注册中文语言并汉化前端 bundle 与主进程菜单。脚本会在必要时就地改写 `app.asar` 补入桌面词库；Claude `4.29+` 会重建 `ion-dist.asar` 并更新 `Claude.exe` 中对应的完整性哈希，原有 Authenticode 签名会失效；同时脚本会自动修补 `cowork-svc.exe` 的客户端签名校验分支，彻底解决 Cowork 工作区因签名失效报 `RPC pipe closed` 的问题（卸载时自动恢复补丁副本中的原文件）。安装后 `English` 界面同样会显示中文（词库被合并覆盖进 `en-US`），切换语言无法回到纯英文，需要卸载或恢复备份才能还原。若 Claude 来自 Microsoft Store，脚本会按启动脚本记录的用户身份在该用户的 `%LOCALAPPDATA%\ClaudeDesktopZhCn\appx-fork` 创建可写副本，并创建“Claude Desktop 中文补丁”快捷方式；原 `WindowsApps` 目录不接管、不写入。第三方模型需在网关或 CC Switch 中映射为 Claude/Anthropic 风格名称。
    - `2` 恢复原样 / 卸载补丁。
    - `3` 自动更新设置：输入 `y` 禁止自动更新，输入 `n` 允许自动更新。
    - `4` CC Switch skills 同步：输入 `y` 开启同步，输入 `n` 删除之前的同步。
@@ -100,9 +100,9 @@ CC Switch skills 同步会扫描 `~/.cc-switch/skills` 下包含 `SKILL.md` 的�
 6. 选择语言：`1`=简体中文，`2`=繁體中文（台灣），`3`=繁體中文（香港）。
 7. 脚本会备份被修改的文件、写入中文资源并重启 Claude Desktop。Claude `4.29+` 的 `ion-dist.asar` 会先解包到临时目录，完成汉化后再重打包并更新 `Claude.exe` 内的 ASAR 头哈希。如果没有自动切换，打开左下角账号菜单，选择 `Language` -> 对应的中文选项。
 
-支持官网安装包（包括历史 Squirrel 版本与官网 MSIX 包）、Microsoft Store 版以及 Scoop（`scoop install extras/claude`）安装。商店版会复制到 `%LOCALAPPDATA%\ClaudeDesktopZhCn\appx-fork` 后处理，卸载时先恢复当前副本备份并删除当前副本；为保证可回退，旧版本副本会保留，原 Store 包始终不变。安装器会自动识别当前系统安装的最新版本并跳过历史升级残留的旧版本目录。若安装在非标准自定义路径，可设置环境变量 `CLAUDE_PATH`（或通过参数 `-ClaudePath`）指定目录后运行脚本。
+支持官网安装包（包括历史 Squirrel 版本与官网 MSIX 包）、Microsoft Store 版以及 Scoop（`scoop install extras/claude`）安装。商店版会复制到当前 Windows 用户自己的 `%LOCALAPPDATA%\ClaudeDesktopZhCn\appx-fork` 后处理；提权时安装器会按启动脚本传入的用户 SID 和用户目录识别对应的 Store 包，不会把副本或配置写到另一个账户。Store 版本更新后会重新生成对应版本副本。卸载时先恢复当前副本备份并删除当前副本，原 Store 包始终不变。安装完成后会为副本创建桌面和开始菜单快捷方式，后续从该快捷方式启动中文副本。若安装在非标准自定义路径，可设置环境变量 `CLAUDE_PATH`（或通过参数 `-ClaudePath`）指定目录后运行脚本。
 
-> **关于 Microsoft Store 商店版**：微软商店原包位于受保护的 `WindowsApps` 目录，脚本不会修改它，也不会接管其所有权。安装时会复制一份到 `%LOCALAPPDATA%\ClaudeDesktopZhCn\appx-fork`，只对副本打补丁并直接启动副本；选择卸载后会先按备份恢复当前副本，再删除当前副本，旧版本副本会保留，原 Store 包可以继续从开始菜单使用和更新。由于副本不带原 AppX 包身份，自动更新、Cowork/沙箱等 Store 专属能力可能仍需从原 Store 版启动。
+> **关于 Microsoft Store 商店版**：微软商店原包位于受保护的 `WindowsApps` 目录，脚本不会修改它，也不会接管其所有权。安装时会复制一份到当前用户的 `%LOCALAPPDATA%\ClaudeDesktopZhCn\appx-fork`，只对副本打补丁并直接启动副本；后续请使用安装器创建的“Claude Desktop 中文补丁”快捷方式。选择卸载后会先按备份恢复当前副本，再删除当前副本，原 Store 包可以继续从开始菜单使用和更新。由于副本不带原 AppX 包身份，自动更新、Cowork/沙箱等 Store 专属能力可能仍需从原 Store 版启动。
 
 ### Microsoft Store 适配的维护方式
 

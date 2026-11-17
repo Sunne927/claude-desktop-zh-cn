@@ -384,6 +384,17 @@ function Write-MultipleClaudeFailureHint {
 function Get-ClaudeAppxPackages {
     # 商店版包名可能调整（issue #194：2.19675.0 起由 Claude 改名为 AnthropicPBC.Claude），
     # 按名称/发布者模糊匹配，误报由调用方对 resources 目录的校验兜底。
+    $sid = [string]$env:CLAUDE_ZH_ORIGINAL_USER_SID
+    if ($sid) {
+        try {
+            return @(Get-AppxPackage -User $sid -ErrorAction Stop | Where-Object {
+                    ($_.Name -like "*Claude*") -or ($_.Publisher -like "*Anthropic*")
+                })
+        }
+        catch {
+            # 某些旧版系统不支持 -User，回退到当前提权上下文。
+        }
+    }
     return @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {
             ($_.Name -like "*Claude*") -or ($_.Publisher -like "*Anthropic*")
         })
@@ -461,6 +472,10 @@ function Remove-LegacyAppxForkArtifacts {
             $shortcutTargets += Join-Path $folder "Claude Desktop 中文补丁.lnk"
         }
     }
+    if ($env:CLAUDE_ZH_ORIGINAL_USER_PROFILE) {
+        $shortcutTargets += Join-Path $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE "Desktop\Claude Desktop 中文补丁.lnk"
+        $shortcutTargets += Join-Path $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Claude Desktop 中文补丁.lnk"
+    }
 
     foreach ($shortcutPath in @($shortcutTargets | Select-Object -Unique)) {
         Remove-Item $shortcutPath -Force -ErrorAction SilentlyContinue
@@ -470,8 +485,47 @@ function Remove-LegacyAppxForkArtifacts {
     # 如果每次安装前清掉副本，卸载和重新安装就无法复用同一份补丁状态。
 }
 
+function New-AppxForkShortcut {
+    param([string]$ClaudePath)
+
+    $exe = Get-ClaudeExePath $ClaudePath
+    if (-not $exe) {
+        return
+    }
+
+    $profile = if ($env:CLAUDE_ZH_ORIGINAL_USER_PROFILE) {
+        $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE
+    } else {
+        $env:USERPROFILE
+    }
+    if (-not $profile) {
+        return
+    }
+
+    $targets = @(
+        (Join-Path $profile "Desktop\Claude Desktop 中文补丁.lnk"),
+        (Join-Path $profile "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Claude Desktop 中文补丁.lnk")
+    )
+    $shell = New-Object -ComObject WScript.Shell
+    foreach ($shortcutPath in @($targets | Select-Object -Unique)) {
+        $parent = Split-Path -Parent $shortcutPath
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = $exe
+        $shortcut.WorkingDirectory = Split-Path -Parent $exe
+        $shortcut.IconLocation = "$exe,0"
+        $shortcut.Description = "Claude Desktop 中文补丁副本"
+        $shortcut.Save()
+    }
+    Write-Host "  已创建中文副本快捷方式（桌面和开始菜单）" -ForegroundColor Green
+}
+
 function Get-AppxForkRoot {
-    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    $localAppData = if ($env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA) {
+        $env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA
+    } else {
+        [Environment]::GetFolderPath('LocalApplicationData')
+    }
     if (-not $localAppData) {
         return $null
     }
@@ -479,6 +533,7 @@ function Get-AppxForkRoot {
 }
 
 function Get-AppxForkCandidates {
+    param([string]$SourcePath = "")
     $root = Get-AppxForkRoot
     if (-not $root -or -not (Test-Path -LiteralPath $root)) {
         return @()
@@ -486,6 +541,10 @@ function Get-AppxForkCandidates {
 
     $candidates = @()
     foreach ($directory in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+        $metadata = Read-AppxForkMetadata $directory.FullName
+        if ($SourcePath -and (-not $metadata -or [string]$metadata.SourcePath -ine $SourcePath)) {
+            continue
+        }
         $resources = Join-Path $directory.FullName "app\resources"
         if (-not (Test-Path -LiteralPath $resources)) {
             $resources = Join-Path $directory.FullName "resources"
@@ -739,9 +798,15 @@ function Get-ClaudeResourcesPath {
         Write-Host "  [提示] 继续尝试商店版（AppX）安装检测。" -ForegroundColor Yellow
     }
 
-    # Microsoft Store 包本身不能写入，但之前已经生成的用户目录副本可以继续
-    # 用于卸载、重新安装和启动。优先复用副本，避免每次操作都重新复制整个包。
-    foreach ($forkPath in @(Get-AppxForkCandidates)) {
+    # 先定位当前 Store 包，再决定是否复用副本。Store 更新后目录名会变化，
+    # 旧副本不能继续遮蔽新版本。
+    $sourceClaudePath = Find-ClaudePath
+    $forkCandidates = if ($sourceClaudePath) {
+        @(Get-AppxForkCandidates $sourceClaudePath)
+    } else {
+        @(Get-AppxForkCandidates)
+    }
+    foreach ($forkPath in $forkCandidates) {
         $forkResources = Join-Path $forkPath "app\resources"
         if (-not (Test-Path -LiteralPath $forkResources)) {
             $forkResources = Join-Path $forkPath "resources"
@@ -759,7 +824,7 @@ function Get-ClaudeResourcesPath {
         }
     }
 
-    $claudePath = Find-ClaudePath
+    $claudePath = $sourceClaudePath
     if (-not $claudePath) {
         if ($script:DetectedUnpackagedClaudePaths.Count -gt 0) {
             throw "未找到可补丁的 Claude Desktop 安装：本地 app-* 目录均缺前端 bundle，商店版也未检测到。请确认 Claude Desktop 已完整安装（安装后至少启动过一次），或清理旧 app-* 目录后重试。"
@@ -788,14 +853,27 @@ function Get-ClaudeResourcesPath {
 }
 
 function Get-ClaudeConfigPaths {
-    if (-not $env:LOCALAPPDATA) {
+    $appDataRoots = @()
+    $localAppDataRoots = @()
+    if ($env:CLAUDE_ZH_ORIGINAL_APPDATA) {
+        $appDataRoots += $env:CLAUDE_ZH_ORIGINAL_APPDATA
+    } elseif ($env:APPDATA) {
+        $appDataRoots += $env:APPDATA
+    }
+    if ($env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA) {
+        $localAppDataRoots += $env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA
+    } elseif ($env:LOCALAPPDATA) {
+        $localAppDataRoots += $env:LOCALAPPDATA
+    }
+
+    if ($localAppDataRoots.Count -eq 0) {
         return @()
     }
 
     $configPaths = @()
-    if ($env:APPDATA) {
-        $configPaths += Join-Path $env:APPDATA "Claude\config.json"
-        $configPaths += Join-Path $env:APPDATA "Claude-3p\config.json"
+    foreach ($appData in @($appDataRoots | Select-Object -Unique)) {
+        $configPaths += Join-Path $appData "Claude\config.json"
+        $configPaths += Join-Path $appData "Claude-3p\config.json"
     }
 
     $packageNames = @()
@@ -806,19 +884,22 @@ function Get-ClaudeConfigPaths {
         }
     }
 
-    if ($packageNames.Count -eq 0) {
-        $packageRoot = Join-Path $env:LOCALAPPDATA "Packages"
-        $packageDirs = @(Get-ChildItem (Join-Path $packageRoot "*Claude_*") -Directory -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending)
-        foreach ($packageDir in $packageDirs) {
-            $packageNames += $packageDir.Name
+    foreach ($localAppData in @($localAppDataRoots | Select-Object -Unique)) {
+        $localPackageNames = @($packageNames)
+        if ($localPackageNames.Count -eq 0) {
+            $packageRoot = Join-Path $localAppData "Packages"
+            $packageDirs = @(Get-ChildItem (Join-Path $packageRoot "*Claude_*") -Directory -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending)
+            foreach ($packageDir in $packageDirs) {
+                $localPackageNames += $packageDir.Name
+            }
         }
-    }
 
-    foreach ($packageName in @($packageNames | Select-Object -Unique)) {
-        $packagePath = Join-Path (Join-Path $env:LOCALAPPDATA "Packages") $packageName
-        $configPaths += Join-Path $packagePath "LocalCache\Roaming\Claude\config.json"
-        $configPaths += Join-Path $packagePath "LocalCache\Roaming\Claude-3p\config.json"
+        foreach ($packageName in @($localPackageNames | Select-Object -Unique)) {
+            $packagePath = Join-Path (Join-Path $localAppData "Packages") $packageName
+            $configPaths += Join-Path $packagePath "LocalCache\Roaming\Claude\config.json"
+            $configPaths += Join-Path $packagePath "LocalCache\Roaming\Claude-3p\config.json"
+        }
     }
 
     return @($configPaths | Select-Object -Unique)
@@ -1670,6 +1751,72 @@ function Read-AsarEntryBytes {
     return $bytes
 }
 
+function Test-FileReplaceable {
+    param(
+        [string]$Path,
+        [int]$TimeoutSeconds = 10
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $true
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        try {
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            $stream.Dispose()
+            return $true
+        }
+        catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds 500
+        }
+        catch [System.UnauthorizedAccessException] {
+            return $false
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    return $false
+}
+
+function Assert-AsarReplaceable {
+    param(
+        [string]$Path,
+        [int]$TimeoutSeconds = 10
+    )
+
+    if (Test-FileReplaceable $Path $TimeoutSeconds) {
+        return
+    }
+
+    throw "无法替换 $Path：文件仍被占用或不可写。请彻底退出 Claude Desktop（任务管理器结束所有 Claude.exe / cowork-svc.exe）后重试；若应用在另一个 Windows 账户下运行，请先注销该账户。"
+}
+
+function Move-FileWithRetry {
+    param(
+        [string]$Source,
+        [string]$Destination,
+        [int]$Retries = 5,
+        [int]$DelayMilliseconds = 500
+    )
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le [Math]::Max(1, $Retries); $attempt++) {
+        try {
+            Move-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            $lastError = $_
+            if ($attempt -lt $Retries) {
+                Start-Sleep -Milliseconds $DelayMilliseconds
+            }
+        }
+    }
+
+    throw "无法替换 $Destination：文件可能仍被 Claude Desktop 占用。请彻底退出 Claude 后重试。原始错误：$($lastError.Exception.Message)"
+}
+
 function Write-AsarArchiveWithHeader {
     param(
         [string]$AsarPath,
@@ -1678,6 +1825,8 @@ function Write-AsarArchiveWithHeader {
         $Header,
         [byte[]]$Append
     )
+
+    Assert-AsarReplaceable -Path $AsarPath
 
     # app.asar 是主进程包，真实安装里含 unpacked / executable / link 条目，解包重打包会丢
     # 这些元数据甚至让应用起不来。这里只替换头部，原有 payload 原样流式拷贝（头内 offset
@@ -1739,7 +1888,13 @@ function Write-AsarArchiveWithHeader {
         throw
     }
 
-    Move-Item -LiteralPath $temporary -Destination $AsarPath -Force
+    try {
+        Move-FileWithRetry -Source $temporary -Destination $AsarPath
+    }
+    catch {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        throw
+    }
 }
 
 function Set-AsarEntryContent {
@@ -2011,13 +2166,14 @@ function Complete-FrontendPatchTarget {
 
     $temporaryAsar = $Target.AsarPath + ".zh-cn-new"
     Remove-Item -LiteralPath $temporaryAsar -Force -ErrorAction SilentlyContinue
+    Assert-AsarReplaceable -Path $Target.AsarPath
     Write-Host "  正在重新打包 ion-dist.asar..." -ForegroundColor DarkGray
     New-AsarArchive $Target.WorkspacePath $temporaryAsar
     try {
         if (-not (Test-AsarFrontendArchive $temporaryAsar)) {
             throw "重新打包后的 ion-dist.asar 未通过结构校验。"
         }
-        Move-Item -LiteralPath $temporaryAsar -Destination $Target.AsarPath -Force
+        Move-FileWithRetry -Source $temporaryAsar -Destination $Target.AsarPath
         Write-Host "  ion-dist.asar 已更新" -ForegroundColor Green
         Sync-ClaudeExeAsarIntegrity $Target.ResourcesPath
     }
@@ -4262,16 +4418,43 @@ function Test-ClaudeDesktopProcessPath {
 
 function Get-ClaudeDesktopProcesses {
     $procs = @()
-    foreach ($proc in Get-Process -Name "claude" -ErrorAction SilentlyContinue) {
-        try {
-            $path = $proc.MainModule.FileName
-            if (Test-ClaudeDesktopProcessPath $path) {
+    $seen = @{}
+    $cimAvailable = $null -ne (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)
+    if ($cimAvailable) {
+        $items = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -ieq "claude.exe" -and (Test-ClaudeDesktopProcessPath $_.ExecutablePath)
+            })
+
+        foreach ($item in $items) {
+            if ($seen.ContainsKey([int]$item.ProcessId)) { continue }
+            $seen[[int]$item.ProcessId] = $true
+            $proc = Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue
+            if ($proc) {
                 $procs += $proc
+            } else {
+                $procs += [pscustomobject]@{
+                    Id = [int]$item.ProcessId
+                    ProcessName = [IO.Path]::GetFileNameWithoutExtension([string]$item.Name)
+                    MainWindowHandle = 0
+                    HasExited = $false
+                }
             }
-        } catch {
-            # MainModule inaccessible (permission or 32/64 mismatch) — skip rather than risk killing Claude Code.
         }
     }
+
+    if (-not $cimAvailable) {
+        foreach ($proc in Get-Process -Name "claude" -ErrorAction SilentlyContinue) {
+            try {
+                $path = $proc.MainModule.FileName
+                if (Test-ClaudeDesktopProcessPath $path) {
+                    $procs += $proc
+                }
+            } catch {
+            }
+        }
+    }
+
     return @($procs | Sort-Object Id -Unique)
 }
 
@@ -4329,7 +4512,7 @@ function Stop-ClaudeProcessesGracefully {
             if ($proc.MainWindowHandle -ne 0) {
                 [void]$proc.CloseMainWindow()
             } else {
-                $null = & taskkill /PID $proc.Id 2>&1
+                $null = & taskkill.exe /PID $proc.Id 2>$null
             }
         } catch {
             # 继续等待，必要时只终止 Claude Desktop 自身，不终止进程树。
@@ -4345,6 +4528,9 @@ function Stop-ClaudeProcessesGracefully {
             } catch {
                 # 已退出或无法终止
             }
+        }
+        foreach ($proc in @(Get-ClaudeDesktopProcesses)) {
+            $null = & taskkill.exe /PID $proc.Id 2>$null
         }
         Start-Sleep -Seconds 1
     }
@@ -4363,6 +4549,10 @@ function Stop-ClaudeProcessesGracefully {
         }
         $remainingCowork = @(Wait-ProcessesExit $coworkProcs 5)
         foreach ($proc in $remainingCowork) {
+            $null = & taskkill.exe /PID $proc.Id 2>$null
+        }
+        Start-Sleep -Milliseconds 500
+        foreach ($proc in @(Get-ClaudeCoworkProcesses)) {
             Write-Host "  [警告] 未能停止 Cowork 进程 PID $($proc.Id)，可能需要管理员权限或手动结束。" -ForegroundColor DarkYellow
         }
     }
@@ -4377,12 +4567,21 @@ function Stop-ClaudeProcessesGracefully {
 }
 
 function Stop-ClaudeProcesses {
-    $killed = Stop-ClaudeProcessesGracefully -TimeoutSeconds 10
-    if ($killed) {
-        Write-Host "  Claude Desktop 已停止" -ForegroundColor Green
-    } else {
-        Write-Host "  已强制停止 Claude Desktop" -ForegroundColor Green
+    param([switch]$RequireStopped)
+
+    $null = Stop-ClaudeProcessesGracefully -TimeoutSeconds 10
+    $remaining = @(@(Get-ClaudeDesktopProcesses) + @(Get-ClaudeCoworkProcesses) | Sort-Object Id -Unique)
+    if ($remaining.Count -gt 0) {
+        $list = ($remaining | ForEach-Object { "$($_.ProcessName) (PID=$($_.Id))" }) -join ", "
+        if ($RequireStopped) {
+            throw "无法停止 Claude Desktop（$list）。请先手动结束这些进程再重试；如果应用在另一个 Windows 账户下运行，请先注销该账户。"
+        }
+        Write-Host "  [警告] 仍有 Claude 进程未退出: $list" -ForegroundColor DarkYellow
+        return $false
     }
+
+    Write-Host "  Claude Desktop 已停止" -ForegroundColor Green
+    return $true
 }
 
 function Restart-Claude {
@@ -4441,7 +4640,7 @@ function Install-WindowsLanguagePack {
         $pack = Get-LanguageResources $LanguageCode
 
         Write-Step "关闭 Claude Desktop"
-        Stop-ClaudeProcesses
+        Stop-ClaudeProcesses -RequireStopped
 
         Write-Step "[2/7] 查找 Claude Desktop"
         $paths = Get-ClaudeResourcesPath
@@ -4495,6 +4694,10 @@ function Install-WindowsLanguagePack {
             Write-Host "  安装类型: Microsoft Store 可写副本" -ForegroundColor DarkGray
         }
         Assert-WriteAccess $resourcesPath "安装"
+        $null = Stop-ClaudeProcesses -RequireStopped
+        foreach ($asarPath in @((Join-Path $resourcesPath "app.asar"), (Join-Path $resourcesPath "ion-dist.asar"))) {
+            Assert-AsarReplaceable -Path $asarPath
+        }
         Remove-LegacyAppxForkArtifacts
         $patchTarget = Initialize-FrontendPatchTarget $resourcesPath
 
@@ -4513,6 +4716,7 @@ function Install-WindowsLanguagePack {
         if ($mergedFrontend -gt 0) {
             Write-Host "  ion-dist.asar 已把 $LanguageCode 词库覆盖进 i18n/en-US.json（$mergedFrontend 条）" -ForegroundColor Green
         }
+        $null = Stop-ClaudeProcesses -RequireStopped
         Patch-DesktopShellLocale $resourcesPath $LanguageCode
         Complete-FrontendPatchTarget $patchTarget
         Close-FrontendPatchTarget $patchTarget
@@ -4529,6 +4733,7 @@ function Install-WindowsLanguagePack {
         Restart-Claude $claudePath
 
         if ($installKind -eq "AppXFork") {
+            New-AppxForkShortcut $claudePath
             Write-Step "跳过 CoworkVMService"
             Write-Host "  [提示] Store 可写副本以普通桌面程序启动，Cowork/沙箱功能可能仍需从原 Store 版启动。" -ForegroundColor DarkYellow
         }
@@ -4578,7 +4783,7 @@ function Uninstall-WindowsLanguagePack {
     Remove-LegacyFridaResident
 
     Write-Step "关闭 Claude Desktop"
-    Stop-ClaudeProcesses
+    Stop-ClaudeProcesses -RequireStopped
     Remove-LegacyAppxForkArtifacts
 
     # 卸载路径同样要写回备份、重同步 exe 哈希，所以也得先把权限拿到。
