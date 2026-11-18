@@ -106,7 +106,7 @@ CC Switch skills 同步会扫描 `~/.cc-switch/skills` 下包含 `SKILL.md` 的�
 >
 > - **独立数据目录**：副本和原 Store 版默认会用同一个数据目录（1p 模式 `%APPDATA%\Claude`，3p 模式 `%LOCALAPPDATA%\Claude-3p`），原版在运行（包括托盘、开机自启）时副本拿不到单实例锁，一打开就退出。安装器会在副本的 `app.asar` 入口最前面注入一段代码，让副本固定使用 `%LOCALAPPDATA%\ClaudeDesktopZhCn\profile`，两者可以同时运行、互不干扰。首次创建该目录时会从现有 `Claude-3p`（或 `Claude`）带入第三方 API 配置（`configLibrary`、`claude_desktop_config.json` 等），会话和登录状态不带入。
 > - **只动当前用户的副本**：安装、卸载只结束路径在当前用户 `appx-fork` 下的 Claude 进程，不会结束原 Store 版或其他 Windows 账户里的 Claude，也不会停 `CoworkVMServiceStore` 服务。
-> - **卸载（菜单 `2`）**：清掉这套方案以及 1.4.24～1.4.28 各版本可能留下的全部东西：
+> - **卸载（菜单 `2`）**：清掉这套方案以及 1.4.24～1.4.30 各版本可能留下的全部东西：
 >   1. 结束副本进程；
 >   2. 删除快捷方式——安装器建的「Claude Desktop 中文补丁」，以及副本运行时自己建的 `Claude.lnk`、改过名或固定到任务栏的，按目标指向副本识别；
 >   3. 删除当前用户的全部副本，包括旧版本误建在提权账户下的副本。删除前先把目录整体改名，有文件被占用时直接报错并保持副本完整，不会删掉一半；
