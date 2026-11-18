@@ -602,18 +602,11 @@ function Get-AppxForkRoot {
 }
 
 function Get-AppxForkRoots {
-    # 卸载/清理要覆盖所有可能的位置：1.4.25~1.4.26 在提权账户与启动账户不同时，
-    # 会把副本建在提权账户自己的 LocalAppData 下。
-    $roots = @()
     $primary = Get-AppxForkRoot
-    if ($primary) {
-        $roots += $primary
+    if (-not $primary) {
+        return @()
     }
-    $elevated = [Environment]::GetFolderPath('LocalApplicationData')
-    if ($elevated) {
-        $roots += Join-Path $elevated "ClaudeDesktopZhCn\appx-fork"
-    }
-    return @($roots | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') } | Select-Object -Unique)
+    return @([IO.Path]::GetFullPath($primary).TrimEnd('\'))
 }
 
 function Get-AppxForkProfilePath {
@@ -5480,12 +5473,18 @@ function Get-OriginalUserRegistryRoot {
         if (Test-Path -LiteralPath $root) {
             return $root
         }
+        return $null
     }
     return "Registry::HKEY_CURRENT_USER"
 }
 
 function Remove-AppxForkRegistryLeftovers {
     param([string]$RegistryRoot = (Get-OriginalUserRegistryRoot))
+
+    if (-not $RegistryRoot) {
+        Write-Host "  原用户注册表配置单元当前未加载，跳过副本注册表清理。" -ForegroundColor DarkYellow
+        return
+    }
 
     # 副本以普通程序运行时会把自己登记成 claude:// 处理程序、通知激活 COM 服务器，
     # 开了「开机启动」还会写 Run 项。副本删掉后这些都成了死链接，claude:// 会打不开。
@@ -5544,7 +5543,7 @@ function Remove-InstallerLeftovers {
     }
 
     $candidates = @()
-    foreach ($localAppData in @($env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA, [Environment]::GetFolderPath('LocalApplicationData'))) {
+    foreach ($localAppData in @($env:CLAUDE_ZH_ORIGINAL_LOCALAPPDATA)) {
         if (-not $localAppData) {
             continue
         }
