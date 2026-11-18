@@ -5545,8 +5545,6 @@ function Remove-InstallerLeftovers {
         $candidates += Join-Path $localAppData "ClaudeDesktopZhCnInstaller"
         $candidates += Join-Path $localAppData "Temp\ClaudeDesktopZhCnInstaller"
     }
-    $candidates += Join-Path ([IO.Path]::GetTempPath()) "ClaudeDesktopZhCnInstaller"
-
     $removed = 0
     foreach ($candidate in @($candidates | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') } | Select-Object -Unique)) {
         if (($current -and $candidate -ieq $current) -or -not (Test-Path -LiteralPath $candidate)) {
