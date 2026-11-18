@@ -495,22 +495,17 @@ function Get-ClaudeExeProductVersion {
 
 function Get-AppxForkShortcutFolders {
     $folders = @()
-    foreach ($folderName in @("Desktop", "CommonDesktopDirectory", "Programs", "CommonPrograms")) {
-        $folder = [Environment]::GetFolderPath($folderName)
-        if ($folder) {
-            $folders += $folder
-        }
+    $userProfile = if ($env:CLAUDE_ZH_ORIGINAL_USER_PROFILE) {
+        $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE
+    } else {
+        $env:USERPROFILE
     }
-    if ($env:CLAUDE_ZH_ORIGINAL_USER_PROFILE) {
-        $userProfile = $env:CLAUDE_ZH_ORIGINAL_USER_PROFILE
+    if ($userProfile) {
         $folders += Join-Path $userProfile "Desktop"
         $folders += @(Get-ChildItem -LiteralPath $userProfile -Directory -Filter "OneDrive*" -ErrorAction SilentlyContinue |
             ForEach-Object { Join-Path $_.FullName "Desktop" })
         $folders += Join-Path $userProfile "AppData\Roaming\Microsoft\Windows\Start Menu\Programs"
         $folders += Join-Path $userProfile "AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
-    }
-    if ($env:APPDATA) {
-        $folders += Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
     }
     return @($folders | Where-Object { $_ } | Select-Object -Unique)
 }
